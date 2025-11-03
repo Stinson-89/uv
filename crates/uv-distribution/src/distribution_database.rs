@@ -538,6 +538,8 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             }
         }
 
+        // If this is a Git distribution, look for the cached wheels...
+
         let metadata = self
             .builder
             .download_and_build_metadata(source, hashes, &self.client)
