@@ -5842,6 +5842,7 @@ dependencies = [
  "owo-colors",
  "reqwest",
  "reqwest-middleware",
+ "rkyv",
  "rmp-serde",
  "rustc-hash",
  "serde",

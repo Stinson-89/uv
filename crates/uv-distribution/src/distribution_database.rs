@@ -12,19 +12,16 @@ use tokio::sync::Semaphore;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{Instrument, info_span, instrument, warn};
 use url::Url;
-
+use uv_auth::PyxTokenStore;
 use uv_cache::{ArchiveId, CacheBucket, CacheEntry, WheelCache};
 use uv_cache_info::{CacheInfo, Timestamp};
-use uv_client::{
-    CacheControl, CachedClientError, Connectivity, DataWithCachePolicy, RegistryClient,
-};
-use uv_distribution_filename::WheelFilename;
-use uv_distribution_types::{
-    BuildInfo, BuildableSource, BuiltDist, Dist, File, HashPolicy, Hashed, IndexUrl, InstalledDist,
-    Name, SourceDist, ToUrlError,
-};
+use uv_client::{CacheControl, CachedClientError, Connectivity, DataWithCachePolicy, MetadataFormat, RegistryClient, VersionFiles};
+use uv_distribution_filename::{DistFilename, WheelFilename};
+use uv_distribution_types::{BuildInfo, BuildableSource, BuiltDist, Dist, File, HashPolicy, Hashed, IndexFormat, IndexMetadata, IndexUrl, InstalledDist, Name, RegistryBuiltDist, RegistryBuiltWheel, SourceDist, ToUrlError};
 use uv_extract::hash::Hasher;
 use uv_fs::write_atomic;
+use uv_git_types::GitHubRepository;
+use uv_pep508::VerbatimUrl;
 use uv_platform_tags::Tags;
 use uv_pypi_types::{HashDigest, HashDigests, PyProjectToml};
 use uv_redacted::DisplaySafeUrl;
@@ -379,6 +376,63 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
         tags: &Tags,
         hashes: HashPolicy<'_>,
     ) -> Result<LocalWheel, Error> {
+        // If this is a Git distribution, look for cached wheels.
+        // TODO(charlie): What if this is unnamed? How can we infer the package name? Maybe we make
+        // the whole thing content-addressed, and assume that the registry contains at most one
+        // package?
+        if let BuildableSource::Dist(SourceDist::Git(dist)) = dist {
+            if dist.subdirectory.is_none() {
+                if let Some(repo) = GitHubRepository::parse(dist.git.repository()) {
+                    if let Ok(store) = PyxTokenStore::from_settings() {
+                        let url = store.api().join(&format!("v1/git/astral-sh/{}/{}", repo.owner, repo.repo)).unwrap();
+                        let index = IndexMetadata {
+                            url: IndexUrl::from(VerbatimUrl::from(url)),
+                            format: IndexFormat::Simple,
+                        };
+                        let archives = self.client
+                            .managed(|client| {
+                                client.package_metadata(
+                                    dist.name(), Some(index.as_ref()), self.build_context.capabilities(), self.build_context
+                                )
+                            })
+                            .await
+                            .map_err(|err| match err {
+                                CachedClientError::Callback { err, .. } => err,
+                                CachedClientError::Client { err, .. } => Error::Client(err),
+                            })?;
+
+                        // TODO(charlie): This needs to prefer wheels to sdists (but allow sdists),
+                        // etc., filter by tags, filter by `requires-python`, etc.
+                        for (_, archive) in archives {
+                            let MetadataFormat::Simple(archive) = archive else {
+                                continue;
+                            };
+                            for datum in archive.iter().rev() {
+                                let files = rkyv::deserialize::<VersionFiles, rkyv::rancor::Error>(&datum.files)
+                                    .expect("archived version files always deserializes");
+                                for (filename, file) in files.all() {
+                                    if let DistFilename::WheelFilename(filename) = filename {
+                                        let dist = BuiltDist::Registry(RegistryBuiltDist {
+                                            wheels: vec![
+                                                RegistryBuiltWheel {
+                                                    filename,
+                                                    file: Box::new(file),
+                                                    index: IndexUrl::from(VerbatimUrl::from(url)),
+                                                }
+                                            ],
+                                            best_wheel_index: 0,
+                                            sdist: None,
+                                        });
+                                        return self.get_wheel(&dist, hashes).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let built_wheel = self
             .builder
             .download_and_build(&BuildableSource::Dist(dist), tags, hashes, &self.client)
@@ -538,7 +592,62 @@ impl<'a, Context: BuildContext> DistributionDatabase<'a, Context> {
             }
         }
 
-        // If this is a Git distribution, look for the cached wheels...
+        // If this is a Git distribution, look for cached wheels.
+        // TODO(charlie): What if this is unnamed? How can we infer the package name? Maybe we make
+        // the whole thing content-addressed, and assume that the registry contains at most one
+        // package?
+        if let BuildableSource::Dist(SourceDist::Git(dist)) = source {
+            if dist.subdirectory.is_none() {
+                if let Some(repo) = GitHubRepository::parse(dist.git.repository()) {
+                    if let Ok(store) = PyxTokenStore::from_settings() {
+                        let url = store.api().join(&format!("v1/git/astral-sh/{}/{}", repo.owner, repo.repo)).unwrap();
+                        let index = IndexMetadata {
+                            url: IndexUrl::from(VerbatimUrl::from(url)),
+                            format: IndexFormat::Simple,
+                        };
+                        let archives = self.client
+                            .managed(|client| {
+                                client.package_metadata(
+                                    dist.name(), Some(index.as_ref()), self.build_context.capabilities(), self.build_context
+                                )
+                            })
+                            .await
+                            .map_err(|err| match err {
+                                CachedClientError::Callback { err, .. } => err,
+                                CachedClientError::Client { err, .. } => Error::Client(err),
+                            })?;
+
+                        // TODO(charlie): This needs to prefer wheels to sdists (but allow sdists),
+                        // etc.
+                        for (_, archive) in archives {
+                            let MetadataFormat::Simple(archive) = archive else {
+                                continue;
+                            };
+                            for datum in archive.iter().rev() {
+                                let files = rkyv::deserialize::<VersionFiles, rkyv::rancor::Error>(&datum.files)
+                                    .expect("archived version files always deserializes");
+                                for (filename, file) in files.all() {
+                                    if let DistFilename::WheelFilename(filename) = filename {
+                                        let dist = BuiltDist::Registry(RegistryBuiltDist {
+                                            wheels: vec![
+                                                RegistryBuiltWheel {
+                                                    filename,
+                                                    file: Box::new(file),
+                                                    index: IndexUrl::from(VerbatimUrl::from(url)),
+                                                }
+                                            ],
+                                            best_wheel_index: 0,
+                                            sdist: None,
+                                        });
+                                        return self.get_wheel_metadata(&dist, hashes).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let metadata = self
             .builder
