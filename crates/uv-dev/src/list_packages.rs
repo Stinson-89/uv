@@ -2,6 +2,7 @@ use anstream::println;
 use anyhow::Result;
 use clap::Parser;
 use tokio::sync::Semaphore;
+
 use uv_cache::{Cache, CacheArgs};
 use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_distribution_types::IndexUrl;
