@@ -5877,7 +5877,6 @@ pub struct PythonInstallCompileBytecodeArgs {
         long,
         alias = "compile",
         overrides_with("no_compile_bytecode"),
-        help_heading = "Installer options",
         env = EnvVars::UV_COMPILE_BYTECODE,
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
@@ -5887,8 +5886,7 @@ pub struct PythonInstallCompileBytecodeArgs {
         long,
         alias = "no-compile",
         overrides_with("compile_bytecode"),
-        hide = true,
-        help_heading = "Installer options"
+        hide = true
     )]
     pub no_compile_bytecode: bool,
 }
